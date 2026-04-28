@@ -1,0 +1,25 @@
+.tg-dl-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 4px 10px;
+  background: #2b5278;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0.85;
+  transition: opacity 0.15s;
+  text-decoration: none;
+  font-family: sans-serif;
+}
+.tg-dl-btn:hover {
+  opacity: 1;
+  background: #3a6ea8;
+}
+.tg-dl-wrap {
+  display: block;
+  margin-top: 4px;
+}
