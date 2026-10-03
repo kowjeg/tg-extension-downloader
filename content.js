@@ -6,12 +6,37 @@ _s.src = chrome.runtime.getURL('downloader.js');
 (document.head || document.documentElement).appendChild(_s);
 _s.remove();
 
-window.addEventListener('message', (e) => {
-  if (e.source !== window || e.data?.type !== 'TG_DL_READY') return;
-  chrome.runtime.sendMessage({ type: 'TG_DL', url: e.data.url, filename: e.data.filename });
-});
-
 const PROCESSED = new WeakSet();
+
+// Войсы: TG играет их через Audio вне DOM, поэтому ссылку ловим в downloader.js
+// при нажатии ▶ и привязываем к войсу, по которому только что кликнули
+const VOICE_URLS = new Map(); // "#чат|id сообщения" -> url
+let pendingVoice = null;      // { key, at }
+
+function voiceKey(voiceEl) {
+  const msg = voiceEl.closest('[data-message-id]');
+  const id = msg && msg.getAttribute('data-message-id');
+  return id ? `${location.hash}|${id}` : null;
+}
+
+document.addEventListener('click', (e) => {
+  const voiceEl = e.target.closest?.('.message-content.voice');
+  const key = voiceEl && voiceKey(voiceEl);
+  if (key) pendingVoice = { key, at: Date.now() };
+}, true);
+
+window.addEventListener('message', (e) => {
+  if (e.source !== window) return;
+  if (e.data?.type === 'TG_DL_READY') {
+    chrome.runtime.sendMessage({ type: 'TG_DL', url: e.data.url, filename: e.data.filename });
+  } else if (e.data?.type === 'TG_DL_AUDIO_SRC') {
+    // Берём только ссылку, пришедшую сразу после клика (не автопереход к следующему войсу)
+    if (!pendingVoice || Date.now() - pendingVoice.at > 5000) return;
+    VOICE_URLS.set(pendingVoice.key, e.data.url);
+    pendingVoice = null;
+    processMedia();
+  }
+});
 
 function makeButton(url, filename) {
   const wrap = document.createElement('div');
@@ -46,7 +71,8 @@ function getMediaName(el, prefix) {
     if (authorEl) author = authorEl.textContent.trim();
 
     const timeEl = msg.querySelector('.message-time');
-    if (timeEl) time = timeEl.textContent.trim();
+    // Текст бывает "edited 20:40" — берём только время
+    if (timeEl) time = (timeEl.textContent.match(/\d{1,2}:\d{2}/) || [''])[0];
   }
 
   // Sanitize for filename
@@ -94,6 +120,20 @@ function processMedia() {
     const prefix = isCircle ? 'circle' : 'video';
     const btn = makeButton(src, `${getMediaName(vid, prefix)}.mp4`);
     mediaContainer.insertAdjacentElement('afterend', btn);
+  });
+
+  // Войсы — кнопка появляется после первого ▶ (когда известна ссылка)
+  const voices = chatRoot.querySelectorAll('.message-content.voice');
+  voices.forEach((voiceEl) => {
+    if (voiceEl.querySelector('.tg-dl-wrap')) return;
+    const key = voiceKey(voiceEl);
+    const url = key && VOICE_URLS.get(key);
+    if (!url) return;
+
+    const anchor = voiceEl.querySelector('.Audio') || voiceEl.firstElementChild;
+    if (!anchor) return;
+    const btn = makeButton(url, `${getMediaName(voiceEl, 'voice')}.ogg`);
+    anchor.insertAdjacentElement('afterend', btn);
   });
 }
 
