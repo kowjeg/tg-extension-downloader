@@ -6,7 +6,8 @@
 //   воркер → страница: { payloads: [{ type: 'methodResponse' | 'methodCallback' | 'updates', ... }] }
 // Ловим этот воркер и шлём в него свои вызовы (sendMessage с isRoundVideo).
 
-const TARGET_KEY = 'tgdl_fwd_target';
+const RECENT_KEY = 'tgdl_fwd_recent';
+const RECENT_LIMIT = 5;
 // Методы, по которым узнаём API-воркер среди прочих (rlottie и т.п. тоже шлют callMethod)
 const API_METHODS = new Set([
   'fetchChats', 'fetchMessages', 'fetchChat', 'fetchFullChat', 'sendMessage',
@@ -65,15 +66,16 @@ function callApi(name, args, onCallback) {
   });
 }
 
-// ---------- Целевой канал ----------
+// ---------- Выбор чата ----------
 
-function loadTarget() {
-  try { return JSON.parse(localStorage.getItem(TARGET_KEY)); } catch { return null; }
+// Последние чаты, куда пересылали, — показываем их первыми
+function loadRecent() {
+  try { return JSON.parse(localStorage.getItem(RECENT_KEY)) || []; } catch { return []; }
 }
 
-function saveTarget(chat) {
-  try { localStorage.setItem(TARGET_KEY, JSON.stringify(chat)); } catch {}
-  window.postMessage({ type: 'TG_FWD_TARGET', title: chat.title }, window.location.origin);
+function saveRecent(chat) {
+  const recent = [chat, ...loadRecent().filter((c) => c.id !== chat.id)].slice(0, RECENT_LIMIT);
+  try { localStorage.setItem(RECENT_KEY, JSON.stringify(recent)); } catch {}
 }
 
 // Куда можно постить: каналы — только где мы владелец/админ с правом публикации
@@ -106,39 +108,64 @@ function pickTarget() {
     overlay.className = 'tg-fwd-overlay';
     overlay.innerHTML = `
       <div class="tg-fwd-modal">
-        <div class="tg-fwd-head">Куда пересылать кружки</div>
+        <div class="tg-fwd-head">Куда переслать кружок</div>
         <input class="tg-fwd-search" placeholder="Поиск или @username + Enter">
-        <div class="tg-fwd-list">Загрузка…</div>
+        <div class="tg-fwd-list"></div>
         <button class="tg-fwd-cancel">Отмена</button>
       </div>`;
     document.body.appendChild(overlay);
 
     const input = overlay.querySelector('.tg-fwd-search');
     const list = overlay.querySelector('.tg-fwd-list');
-    let chats = [];
+    const recent = loadRecent();
+    let chats = null; // null — ещё грузятся
+    let loadError = null;
 
     const close = (chat) => {
       overlay.remove();
-      if (chat) saveTarget(chat);
+      if (chat) saveRecent(chat);
       resolve(chat || null);
+    };
+
+    const addSection = (title) => {
+      const head = document.createElement('div');
+      head.className = 'tg-fwd-section';
+      head.textContent = title;
+      list.appendChild(head);
     };
 
     const render = () => {
       const q = input.value.trim().toLowerCase();
-      const shown = chats.filter((c) => !q || c.title.toLowerCase().includes(q));
-      list.textContent = shown.length ? '' : 'Ничего не найдено';
-      shown.forEach((chat) => {
-        const row = document.createElement('div');
-        row.className = 'tg-fwd-row';
-        row.textContent = chat.title;
-        const type = document.createElement('span');
-        type.className = 'tg-fwd-type';
-        type.textContent = CHAT_TYPE_LABEL[chat.type] || '';
-        row.appendChild(type);
-        row.addEventListener('click', () => close(chat));
-        list.appendChild(row);
-      });
+      const match = (c) => !q || c.title.toLowerCase().includes(q);
+      const recentIds = new Set(recent.map((c) => c.id));
+      const shownRecent = recent.filter(match);
+      const shownAll = (chats || []).filter((c) => !recentIds.has(c.id) && match(c));
+
+      list.textContent = '';
+      if (shownRecent.length) {
+        addSection('Недавние');
+        shownRecent.forEach(addRow);
+      }
+      if (shownAll.length) {
+        if (shownRecent.length) addSection('Все чаты');
+        shownAll.forEach(addRow);
+      }
+      if (loadError) addSection('Ошибка: ' + loadError);
+      else if (!chats) addSection('Загрузка…');
+      else if (!shownRecent.length && !shownAll.length) addSection('Ничего не найдено');
     };
+
+    function addRow(chat) {
+      const row = document.createElement('div');
+      row.className = 'tg-fwd-row';
+      row.textContent = chat.title;
+      const type = document.createElement('span');
+      type.className = 'tg-fwd-type';
+      type.textContent = CHAT_TYPE_LABEL[chat.type] || '';
+      row.appendChild(type);
+      row.addEventListener('click', () => close(chat));
+      list.appendChild(row);
+    }
 
     input.addEventListener('input', render);
     input.addEventListener('keydown', async (e) => {
@@ -157,10 +184,11 @@ function pickTarget() {
     overlay.querySelector('.tg-fwd-cancel').addEventListener('click', () => close(null));
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
     input.focus();
+    render();
 
     loadChats()
       .then((res) => { chats = res; render(); })
-      .catch((err) => { list.textContent = 'Ошибка: ' + err.message; });
+      .catch((err) => { loadError = err.message; render(); });
   });
 }
 
@@ -219,7 +247,7 @@ function watchSendResult(chatId) {
 }
 
 async function forwardCircle(url, onStatus) {
-  const target = loadTarget() || await pickTarget();
+  const target = await pickTarget();
   if (!target) { onStatus('Отменено', 'idle'); return; }
 
   onStatus('Скачиваю…');
@@ -275,12 +303,4 @@ window.addEventListener('tg-fwd-request', async (e) => {
     console.error('[TG-FWD] error:', err);
     onStatus('Ошибка: ' + err.message, 'error');
   }
-});
-
-window.addEventListener('tg-fwd-pick', () => { pickTarget(); });
-
-// Сообщаем content.js текущую цель, чтобы показать её на кнопках
-window.addEventListener('tg-fwd-hello', () => {
-  const target = loadTarget();
-  if (target) window.postMessage({ type: 'TG_FWD_TARGET', title: target.title }, window.location.origin);
 });
