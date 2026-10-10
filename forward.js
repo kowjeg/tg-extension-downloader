@@ -1,10 +1,10 @@
-// Пересылка кружков от своего имени через внутренний API TG Web A.
+// Пересылка кружков, фото и войсов от своего имени через внутренний API TG Web A.
 // Runs in page context (MAIN world, document_start).
 //
 // TG Web A ходит в Telegram через GramJS в отдельном Web Worker. Протокол:
 //   страница → воркер: { payloads: [{ type: 'callMethod', messageId, name, args, withCallback }] }
 //   воркер → страница: { payloads: [{ type: 'methodResponse' | 'methodCallback' | 'updates', ... }] }
-// Ловим этот воркер и шлём в него свои вызовы (sendMessage с isRoundVideo).
+// Ловим этот воркер и шлём в него свои вызовы (sendMessage с вложением).
 
 const RECENT_KEY = 'tgdl_fwd_recent';
 const RECENT_LIMIT = 5;
@@ -108,7 +108,7 @@ function pickTarget() {
     overlay.className = 'tg-fwd-overlay';
     overlay.innerHTML = `
       <div class="tg-fwd-modal">
-        <div class="tg-fwd-head">Куда переслать кружок</div>
+        <div class="tg-fwd-head">Куда переслать</div>
         <input class="tg-fwd-search" placeholder="Поиск или @username + Enter">
         <div class="tg-fwd-list"></div>
         <button class="tg-fwd-cancel">Отмена</button>
@@ -246,29 +246,111 @@ function watchSendResult(chatId) {
   };
 }
 
-async function forwardCircle(url, onStatus) {
+// Размеры фото
+function readImageMeta(blobUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => reject(new Error('не удалось прочитать фото'));
+    img.src = blobUrl;
+  });
+}
+
+// Длительность и волна войса (63 точки 0–255, как отправляет сам TG Web A)
+const WAVEFORM_POINTS = 63;
+async function readVoiceMeta(blob) {
+  const ctx = new OfflineAudioContext(1, 1, 8000);
+  try {
+    const audio = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const data = audio.getChannelData(0);
+    const step = Math.max(1, Math.floor(data.length / WAVEFORM_POINTS));
+    const peaks = Array.from({ length: WAVEFORM_POINTS }, (_, i) => {
+      let peak = 0;
+      for (let j = i * step, end = Math.min(j + step, data.length); j < end; j++) {
+        peak = Math.max(peak, Math.abs(data[j]));
+      }
+      return peak;
+    });
+    const max = Math.max(...peaks) || 1;
+    return {
+      duration: Math.max(1, Math.round(audio.duration)),
+      waveform: peaks.map((p) => Math.round((p / max) * 255)),
+    };
+  } catch (err) {
+    // Не смогли декодировать — длительность из <audio>, волна ровная
+    console.warn('[TG-FWD] voice decode failed:', err);
+    const duration = await new Promise((resolve) => {
+      const el = new Audio();
+      el.onloadedmetadata = () => resolve(el.duration);
+      el.onerror = () => resolve(1);
+      el.src = URL.createObjectURL(blob);
+    });
+    return {
+      duration: Math.max(1, Math.round(Number.isFinite(duration) ? duration : 1)),
+      waveform: Array(WAVEFORM_POINTS).fill(128),
+    };
+  }
+}
+
+// Собирает ApiAttachment для sendMessage. Возвращает { attachment, cleanup }
+async function buildAttachment(kind, blob, contentType) {
+  const urls = [];
+  const makeUrl = (b) => { const u = URL.createObjectURL(b); urls.push(u); return u; };
+  const base = { size: blob.size, uniqueId: `tgdl_${Date.now()}` };
+  let attachment;
+
+  if (kind === 'circle') {
+    const blobUrl = makeUrl(new Blob([blob], { type: 'video/mp4' }));
+    const meta = await readVideoMeta(blobUrl);
+    if (meta.previewBlobUrl) urls.push(meta.previewBlobUrl);
+    attachment = {
+      ...base,
+      blobUrl,
+      filename: 'video.mp4',
+      mimeType: 'video/mp4',
+      quick: { width: meta.width, height: meta.height, duration: meta.duration },
+      previewBlobUrl: meta.previewBlobUrl,
+      isRoundVideo: true,
+    };
+  } else if (kind === 'photo') {
+    // Фото TG принимает как фото только в jpeg/png, остальное — файлом
+    const mimeType = /png/.test(contentType) ? 'image/png' : /jpe?g/.test(contentType) || !contentType ? 'image/jpeg' : contentType;
+    const blobUrl = makeUrl(new Blob([blob], { type: mimeType }));
+    const asPhoto = mimeType === 'image/jpeg' || mimeType === 'image/png';
+    attachment = {
+      ...base,
+      blobUrl,
+      filename: mimeType === 'image/png' ? 'photo.png' : 'photo.jpg',
+      mimeType,
+      ...(asPhoto ? { quick: await readImageMeta(blobUrl) } : { shouldSendAsFile: true }),
+    };
+  } else if (kind === 'voice') {
+    const blobUrl = makeUrl(new Blob([blob], { type: 'audio/ogg' }));
+    attachment = {
+      ...base,
+      blobUrl,
+      filename: 'voice.ogg',
+      mimeType: 'audio/ogg',
+      voice: await readVoiceMeta(blob),
+    };
+  } else {
+    throw new Error('неизвестный тип: ' + kind);
+  }
+
+  // Воркер читает blob-ссылки во время загрузки — освобождаем с запасом
+  const cleanup = () => setTimeout(() => urls.forEach((u) => URL.revokeObjectURL(u)), 10000);
+  return { attachment, cleanup };
+}
+
+async function forwardMedia(url, kind, onStatus) {
   const target = await pickTarget();
   if (!target) { onStatus('Отменено', 'idle'); return; }
 
   onStatus('Скачиваю…');
-  const { blob } = await fetchMedia(url, (p) => onStatus(`Скачиваю ${p}%`));
-  const blobUrl = URL.createObjectURL(new Blob([blob], { type: 'video/mp4' }));
+  const { blob, contentType } = await fetchMedia(url, (p) => onStatus(`Скачиваю ${p}%`));
+  const { attachment, cleanup } = await buildAttachment(kind, blob, contentType);
 
-  let meta;
   try {
-    meta = await readVideoMeta(blobUrl);
-
-    const attachment = {
-      blobUrl,
-      filename: 'video.mp4',
-      mimeType: 'video/mp4',
-      size: blob.size,
-      quick: { width: meta.width, height: meta.height, duration: meta.duration },
-      previewBlobUrl: meta.previewBlobUrl,
-      uniqueId: `tgdl_${Date.now()}`,
-      isRoundVideo: true,
-    };
-
     onStatus('Отправляю…');
     const watch = watchSendResult(target.id);
     let result;
@@ -284,21 +366,17 @@ async function forwardCircle(url, onStatus) {
     if (result === 'ok') onStatus(`✓ В «${target.title}»`, 'done');
     else throw new Error(result || 'загрузка не удалась');
   } finally {
-    // Воркер уже всё прочитал — освобождаем память
-    setTimeout(() => {
-      URL.revokeObjectURL(blobUrl);
-      if (meta?.previewBlobUrl) URL.revokeObjectURL(meta.previewBlobUrl);
-    }, 10000);
+    cleanup();
   }
 }
 
 window.addEventListener('tg-fwd-request', async (e) => {
-  const { url, reqId } = e.detail;
+  const { url, kind, reqId } = e.detail;
   const onStatus = (text, state = 'busy') => {
     window.postMessage({ type: 'TG_FWD_STATUS', reqId, text, state }, window.location.origin);
   };
   try {
-    await forwardCircle(url, onStatus);
+    await forwardMedia(url, kind, onStatus);
   } catch (err) {
     console.error('[TG-FWD] error:', err);
     onStatus('Ошибка: ' + err.message, 'error');

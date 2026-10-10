@@ -43,23 +43,23 @@ window.addEventListener('message', (e) => {
   }
 });
 
-// Пересылка кружков от своего имени (forward.js)
+// Пересылка кружков, фото и войсов от своего имени (forward.js)
 const FWD_LABEL = '↪ Переслать';
 const FWD_BUTTONS = new Map(); // reqId -> кнопка, ждущая статуса
 let fwdSeq = 0;
 
-function addForwardButton(wrap, url) {
+function addForwardButton(wrap, url, kind) {
   const btn = document.createElement('button');
   btn.className = 'tg-dl-btn tg-fwd-btn';
   btn.textContent = FWD_LABEL;
-  btn.title = 'Переслать кружок в канал, группу или личку';
+  btn.title = 'Переслать в канал, группу или личку';
   btn.addEventListener('click', (e) => {
     e.preventDefault();
     e.stopPropagation();
     const reqId = ++fwdSeq;
     FWD_BUTTONS.set(reqId, btn);
     btn.dataset.state = 'busy';
-    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, reqId } }));
+    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, kind, reqId } }));
   });
 
   wrap.append(btn);
@@ -130,6 +130,7 @@ function processMedia() {
     // чтобы overflow:hidden не обрезал кнопку
     const mediaContainer = img.closest('.media-photo, .album-item') || img.parentElement;
     const btn = makeButton(src, `${getMediaName(img, 'photo')}.jpg`);
+    addForwardButton(btn, src, 'photo');
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
@@ -146,7 +147,7 @@ function processMedia() {
     const isCircle = !!vid.closest('.RoundVideo, .media-round');
     const prefix = isCircle ? 'circle' : 'video';
     const btn = makeButton(src, `${getMediaName(vid, prefix)}.mp4`);
-    if (isCircle) addForwardButton(btn, src);
+    if (isCircle) addForwardButton(btn, src, 'circle');
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
@@ -161,6 +162,7 @@ function processMedia() {
     const anchor = voiceEl.querySelector('.Audio') || voiceEl.firstElementChild;
     if (!anchor) return;
     const btn = makeButton(url, `${getMediaName(voiceEl, 'voice')}.ogg`);
+    addForwardButton(btn, url, 'voice');
     anchor.insertAdjacentElement('afterend', btn);
   });
 }
