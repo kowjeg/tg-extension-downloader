@@ -68,7 +68,10 @@ function getPostInfo(el) {
     clone.querySelectorAll('.MessageMeta, .tg-dl-wrap').forEach((n) => n.remove());
     domText = clone.innerText.trim();
   }
-  return Number.isInteger(messageId) && chatId ? { chatId, messageId, domText } : null;
+  // Название чата из шапки — запасной вариант для строки «Переслано из»
+  const chatTitle = document.querySelector('.MiddleHeader .ChatInfo .fullName, .MiddleHeader .fullName')
+    ?.textContent.trim();
+  return Number.isInteger(messageId) && chatId ? { chatId, messageId, domText, chatTitle } : null;
 }
 
 // sourceEl — элемент внутри исходного сообщения, по нему находим пост в момент нажатия.

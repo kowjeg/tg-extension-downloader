@@ -181,7 +181,8 @@ const CHAT_TYPE_LABEL = {
   chatTypeChannel: 'канал', chatTypeSuperGroup: 'группа', chatTypeBasicGroup: 'группа', chatTypePrivate: 'личка',
 };
 
-// Модалка выбора чата. Резолвит выбранный ApiChat или null
+// Модалка выбора чата. Резолвит { chat, withSource } или null.
+// withSource — галочка «указать, откуда переслано» (по умолчанию включена)
 function pickTarget() {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -191,7 +192,10 @@ function pickTarget() {
         <div class="tg-fwd-head">Куда переслать</div>
         <input class="tg-fwd-search" placeholder="Поиск или @username + Enter">
         <div class="tg-fwd-list"></div>
-        <button class="tg-fwd-cancel">Отмена</button>
+        <div class="tg-fwd-foot">
+          <label class="tg-fwd-check"><input type="checkbox" checked> Указать, откуда переслано</label>
+          <button class="tg-fwd-cancel">Отмена</button>
+        </div>
       </div>`;
     document.body.appendChild(overlay);
 
@@ -201,10 +205,12 @@ function pickTarget() {
     let chats = null; // null — ещё грузятся
     let loadError = null;
 
+    const withSourceInput = overlay.querySelector('.tg-fwd-check input');
+
     const close = (chat) => {
       overlay.remove();
       if (chat) saveRecent(chat);
-      resolve(chat || null);
+      resolve(chat ? { chat, withSource: withSourceInput.checked } : null);
     };
 
     const addSection = (title) => {
@@ -471,24 +477,63 @@ async function sendBatch(target, paramsList, onStatus) {
   if (result !== 'ok') throw new Error(result || 'загрузка не удалась');
 }
 
+// Строка «Переслано из «Канал»» цитатой перед текстом; название — ссылка на пост, если канал публичный
+function buildSourceText(post) {
+  const chat = CHATS.get(post.chatId);
+  const title = chat?.title || post.chatTitle;
+  if (!title) return null;
+
+  const prefix = 'Переслано из «';
+  const text = `${prefix}${title}»`;
+  const entities = [{ type: 'MessageEntityBlockquote', offset: 0, length: text.length }];
+  const username = chat?.usernames?.find((u) => u.isActive)?.username || chat?.usernames?.[0]?.username;
+  if (username) {
+    entities.push({
+      type: 'MessageEntityTextUrl', offset: prefix.length, length: title.length,
+      url: `https://t.me/${username}/${post.messageId}`,
+    });
+  }
+  return { text, entities };
+}
+
+// Склеивает строку источника и текст поста (сдвигая entities текста)
+function joinTexts(source, text) {
+  if (!source) return text;
+  if (!text) return source;
+  const shift = source.text.length + 1;
+  return {
+    text: `${source.text}\n${text.text}`,
+    entities: [
+      ...source.entities,
+      ...(text.entities || []).map((e) => ({ ...e, offset: e.offset + shift })),
+    ],
+  };
+}
+
 // Подпись к медиа без Premium — до 1024 символов, длиннее шлём отдельным сообщением
 const CAPTION_LIMIT = 1024;
 
 // kind: 'circle' | 'video' | 'photo' | 'voice' | 'text' | 'album'.
 // Для альбома items — [{ url, kind: 'photo' | 'video' }]. post — { chatId, messageId, domText } исходного поста
 async function forward({ url, kind, items, post }, onStatus) {
-  const target = await pickTarget();
-  if (!target) { onStatus('Отменено', 'idle'); return; }
+  const picked = await pickTarget();
+  if (!picked) { onStatus('Отменено', 'idle'); return; }
+  const target = picked.chat;
 
-  // У кружков подписи не бывает
-  const text = kind === 'circle' || !post ? null : await getPostText(post);
+  const source = picked.withSource && post ? buildSourceText(post) : null;
+  // У кружков подписи не бывает — строку источника шлём отдельным сообщением перед кружком
+  const postText = kind === 'circle' || !post ? null : await getPostText(post);
+  if (kind === 'text' && !postText) throw new Error('не нашёл текст поста');
+  const text = kind === 'circle' ? null : joinTexts(source, postText);
   const textParams = text && { text: text.text, entities: text.entities };
 
   if (kind === 'text') {
-    if (!text) throw new Error('не нашёл текст поста');
     await sendBatch(target, [textParams], onStatus);
     onStatus(`✓ В «${target.title}»`, 'done');
     return;
+  }
+  if (kind === 'circle' && source) {
+    await sendBatch(target, [{ text: source.text, entities: source.entities }], onStatus);
   }
 
   const media = kind === 'album' ? items : [{ url, kind }];

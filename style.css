@@ -72,8 +72,21 @@
 }
 .tg-fwd-row:hover { background: #2b5278; }
 .tg-fwd-type { color: #aaa; font-size: 12px; flex-shrink: 0; }
+.tg-fwd-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tg-fwd-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #ccc;
+  cursor: pointer;
+}
 .tg-fwd-cancel {
-  align-self: flex-end;
   padding: 6px 12px;
   background: transparent;
   color: #8ab4f8;
