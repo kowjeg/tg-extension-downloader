@@ -23,3 +23,61 @@
   display: block;
   margin-top: 4px;
 }
+.tg-dl-wrap .tg-dl-btn + .tg-dl-btn {
+  margin-left: 6px;
+}
+.tg-fwd-btn[data-state="busy"] { opacity: 0.6; pointer-events: none; }
+.tg-fwd-btn[data-state="done"] { background: #2e7d32; }
+.tg-fwd-btn[data-state="error"] { background: #b3261e; }
+
+.tg-fwd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  font-family: sans-serif;
+}
+.tg-fwd-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(360px, calc(100vw - 32px));
+  max-height: 70vh;
+  padding: 16px;
+  background: #212121;
+  color: #fff;
+  border-radius: 10px;
+}
+.tg-fwd-head { font-size: 15px; font-weight: 600; }
+.tg-fwd-search {
+  padding: 8px 10px;
+  background: #2c2c2c;
+  color: #fff;
+  border: 1px solid #444;
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+}
+.tg-fwd-list { overflow-y: auto; font-size: 14px; min-height: 40px; }
+.tg-fwd-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tg-fwd-row:hover { background: #2b5278; }
+.tg-fwd-type { color: #aaa; font-size: 12px; flex-shrink: 0; }
+.tg-fwd-cancel {
+  align-self: flex-end;
+  padding: 6px 12px;
+  background: transparent;
+  color: #8ab4f8;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+}

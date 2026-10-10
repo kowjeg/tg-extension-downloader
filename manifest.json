@@ -1,16 +1,18 @@
 {
   "manifest_version": 3,
   "name": "TG Media Downloader",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Добавляет кнопку скачать под медиа в Telegram Web",
   "permissions": ["downloads"],
   "host_permissions": ["https://web.telegram.org/*"],
   "background": { "service_worker": "background.js" },
-  "web_accessible_resources": [{
-    "resources": ["downloader.js"],
-    "matches": ["https://web.telegram.org/*"]
-  }],
   "content_scripts": [
+    {
+      "matches": ["https://web.telegram.org/*"],
+      "js": ["downloader.js", "forward.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": ["https://web.telegram.org/*"],
       "js": ["content.js"],

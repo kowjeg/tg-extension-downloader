@@ -1,10 +1,6 @@
 // TG Media Downloader — добавляет кнопку скачать под медиа в чате
 
-// Inject downloader into page context so it can reach the TG service worker
-const _s = document.createElement('script');
-_s.src = chrome.runtime.getURL('downloader.js');
-(document.head || document.documentElement).appendChild(_s);
-_s.remove();
+// downloader.js и forward.js подключены в manifest.json в MAIN world (контекст страницы)
 
 const PROCESSED = new WeakSet();
 
@@ -35,8 +31,60 @@ window.addEventListener('message', (e) => {
     VOICE_URLS.set(pendingVoice.key, e.data.url);
     pendingVoice = null;
     processMedia();
+  } else if (e.data?.type === 'TG_FWD_STATUS') {
+    const btn = FWD_BUTTONS.get(e.data.reqId);
+    if (!btn) return;
+    btn.textContent = e.data.text;
+    btn.dataset.state = e.data.state;
+    if (e.data.state !== 'busy') {
+      FWD_BUTTONS.delete(e.data.reqId);
+      setTimeout(() => { btn.textContent = FWD_LABEL; btn.dataset.state = ''; }, 4000);
+    }
+  } else if (e.data?.type === 'TG_FWD_TARGET') {
+    fwdTargetTitle = e.data.title;
+    document.querySelectorAll('.tg-fwd-btn').forEach(setFwdTitle);
   }
 });
+
+// Пересылка кружков от своего имени (forward.js)
+const FWD_LABEL = '↪ В канал';
+const FWD_BUTTONS = new Map(); // reqId -> кнопка, ждущая статуса
+let fwdTargetTitle = null;
+let fwdSeq = 0;
+
+function setFwdTitle(btn) {
+  btn.title = fwdTargetTitle ? `Переслать кружок в «${fwdTargetTitle}»` : 'Выбрать канал и переслать кружок';
+}
+
+function addForwardButtons(wrap, url) {
+  const btn = document.createElement('button');
+  btn.className = 'tg-dl-btn tg-fwd-btn';
+  btn.textContent = FWD_LABEL;
+  setFwdTitle(btn);
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const reqId = ++fwdSeq;
+    FWD_BUTTONS.set(reqId, btn);
+    btn.dataset.state = 'busy';
+    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, reqId } }));
+  });
+
+  const pick = document.createElement('button');
+  pick.className = 'tg-dl-btn';
+  pick.textContent = '⚙';
+  pick.title = 'Выбрать канал для пересылки';
+  pick.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    window.dispatchEvent(new CustomEvent('tg-fwd-pick'));
+  });
+
+  wrap.append(btn, pick);
+}
+
+// Узнаём у forward.js текущую цель (он загружен раньше, в document_start)
+window.dispatchEvent(new CustomEvent('tg-fwd-hello'));
 
 function makeButton(url, filename) {
   const wrap = document.createElement('div');
@@ -119,6 +167,7 @@ function processMedia() {
     const isCircle = !!vid.closest('.RoundVideo, .media-round');
     const prefix = isCircle ? 'circle' : 'video';
     const btn = makeButton(src, `${getMediaName(vid, prefix)}.mp4`);
+    if (isCircle) addForwardButtons(btn, src);
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
