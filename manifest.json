@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "TG Media Downloader",
-  "version": "1.1",
-  "description": "Добавляет кнопку скачать под медиа в Telegram Web",
+  "version": "1.2",
+  "description": "Скачивание медиа и пересылка постов от своего имени в Telegram Web",
   "permissions": ["downloads"],
   "host_permissions": ["https://web.telegram.org/*"],
   "background": { "service_worker": "background.js" },
