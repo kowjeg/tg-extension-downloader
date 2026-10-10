@@ -46,7 +46,7 @@ window.addEventListener('message', (e) => {
     btn.dataset.state = e.data.state;
     if (e.data.state !== 'busy') {
       FWD_BUTTONS.delete(e.data.reqId);
-      setTimeout(() => { btn.textContent = FWD_LABEL; btn.dataset.state = ''; }, 4000);
+      setTimeout(() => { btn.textContent = btn.dataset.label || FWD_LABEL; btn.dataset.state = ''; }, 4000);
     }
   }
 });
@@ -71,8 +71,9 @@ function getPostInfo(el) {
   return Number.isInteger(messageId) && chatId ? { chatId, messageId, domText } : null;
 }
 
-// sourceEl — элемент внутри исходного сообщения, по нему находим пост в момент нажатия
-function addForwardButton(wrap, url, kind, sourceEl) {
+// sourceEl — элемент внутри исходного сообщения, по нему находим пост в момент нажатия.
+// getItems — для альбома: собирает [{ url, kind }] в момент нажатия
+function addForwardButton(wrap, url, kind, sourceEl, getItems) {
   const btn = document.createElement('button');
   btn.className = 'tg-dl-btn tg-fwd-btn';
   btn.textContent = FWD_LABEL;
@@ -82,16 +83,36 @@ function addForwardButton(wrap, url, kind, sourceEl) {
     e.stopPropagation();
     const reqId = ++fwdSeq;
     FWD_BUTTONS.set(reqId, btn);
+    let items;
+    if (getItems) {
+      items = getItems();
+      if (items.error) {
+        btn.textContent = items.error;
+        btn.dataset.state = 'error';
+        setTimeout(() => { btn.textContent = btn.dataset.label || FWD_LABEL; btn.dataset.state = ''; }, 4000);
+        return;
+      }
+    }
     btn.dataset.state = 'busy';
-    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, kind, reqId, post: getPostInfo(sourceEl) } }));
+    window.dispatchEvent(new CustomEvent('tg-fwd-request', {
+      detail: { url, kind, items, reqId, post: getPostInfo(sourceEl) },
+    }));
   });
 
   wrap.append(btn);
 }
 
-function makeButton(url, filename) {
+function makeWrap(extraClass = '') {
   const wrap = document.createElement('div');
-  wrap.className = 'tg-dl-wrap';
+  wrap.className = `tg-dl-wrap ${extraClass}`.trim();
+  ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((type) => {
+    wrap.addEventListener(type, (e) => e.stopPropagation());
+  });
+  return wrap;
+}
+
+function makeButton(url, filename) {
+  const wrap = makeWrap();
 
   const btn = document.createElement('a');
   btn.className = 'tg-dl-btn';
@@ -149,6 +170,7 @@ function processMedia() {
     if (img.closest('.reactions, .reaction, .message-reactions, .reaction-list, .emoji-status, .sticker-emoji')) return;
 
     PROCESSED.add(img);
+    if (img.closest('.Album')) return;
 
     // Берём ближайший медиа-контейнер и вставляем кнопку ПОСЛЕ него (не внутрь),
     // чтобы overflow:hidden не обрезал кнопку
@@ -166,12 +188,13 @@ function processMedia() {
     if (!isValidSrc(src)) return;
 
     PROCESSED.add(vid);
+    if (vid.closest('.Album')) return;
 
     const mediaContainer = vid.closest('.RoundVideo, .media-round, .media-video') || vid.parentElement;
     const isCircle = !!vid.closest('.RoundVideo, .media-round');
     const prefix = isCircle ? 'circle' : 'video';
     const btn = makeButton(src, `${getMediaName(vid, prefix)}.mp4`);
-    if (isCircle) addForwardButton(btn, src, 'circle', vid);
+    addForwardButton(btn, src, isCircle ? 'circle' : 'video', vid);
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
@@ -195,6 +218,31 @@ function processMedia() {
     anchor.insertAdjacentElement('afterend', btn);
   });
 
+  // Альбомы — одна строка кнопок под альбомом: скачать все / переслать альбомом
+  chatRoot.querySelectorAll('.Album').forEach((album) => {
+    if (PROCESSED.has(album)) return;
+    PROCESSED.add(album);
+
+    const wrap = makeWrap();
+    const dl = document.createElement('button');
+    dl.className = 'tg-dl-btn';
+    dl.textContent = '⬇ Скачать все';
+    dl.addEventListener('click', () => {
+      const items = getAlbumItems(album);
+      if (items.error) { dl.textContent = items.error; return; }
+      const name = getMediaName(album, 'album');
+      items.forEach((item, i) => {
+        const filename = `${name}_${i + 1}.${item.kind === 'video' ? 'mp4' : 'jpg'}`;
+        window.dispatchEvent(new CustomEvent('tg-dl-request', { detail: { url: item.url, filename } }));
+      });
+    });
+    wrap.appendChild(dl);
+    addForwardButton(wrap, null, 'album', album, () => getAlbumItems(album));
+    const fwdBtn = wrap.querySelector('.tg-fwd-btn');
+    fwdBtn.textContent = fwdBtn.dataset.label = FWD_ALBUM_LABEL;
+    album.insertAdjacentElement('afterend', wrap);
+  });
+
   // Посты только с текстом — кнопка пересылки (видна при наведении)
   const texts = chatRoot.querySelectorAll('.message-content .text-content');
   texts.forEach((textEl) => {
@@ -204,11 +252,28 @@ function processMedia() {
     if (content.classList.contains('voice') || content.querySelector(TEXT_SKIP_MEDIA)) return;
     if (content.querySelector(':scope > .tg-fwd-text-wrap')) return;
 
-    const wrap = document.createElement('div');
-    wrap.className = 'tg-dl-wrap tg-fwd-text-wrap';
+    const wrap = makeWrap('tg-fwd-text-wrap');
     addForwardButton(wrap, null, 'text', textEl);
     content.appendChild(wrap);
   });
+}
+
+const FWD_ALBUM_LABEL = '↪ Переслать альбом';
+
+// Элементы альбома по порядку. Видео без загруженного src (не автоплей) пока не умеем
+function getAlbumItems(album) {
+  const items = [];
+  for (const item of album.querySelectorAll('.album-item')) {
+    const video = item.querySelector('video');
+    const videoSrc = video && (video.src || video.currentSrc);
+    const img = item.querySelector('img.full-media');
+    const imgSrc = img && (img.src || img.currentSrc);
+    if (isValidSrc(videoSrc)) items.push({ url: videoSrc, kind: 'video' });
+    else if (item.querySelector('.message-media-duration')) return { error: 'Видео не загружено' };
+    else if (isValidSrc(imgSrc)) items.push({ url: imgSrc, kind: 'photo' });
+    else return { error: 'Фото не загружено' };
+  }
+  return items.length ? items : { error: 'Альбом пуст' };
 }
 
 // Сообщения с медиа (в т.ч. неподдерживаемыми) не считаем текстовыми

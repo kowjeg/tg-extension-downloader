@@ -62,8 +62,15 @@ function attachWorker(worker) {
 // проходит через воркер — запоминаем по дороге, чтобы не запрашивать заново
 
 const CHATS = new Map();  // chatId -> ApiChat
-const TEXTS = new Map();  // "chatId|messageId" -> { text, entities }
+const TEXTS = new Map();  // "chatId|messageId" и "chatId|g<groupedId>" -> { text, entities }
+const GROUPS = new Map(); // "chatId|messageId" -> groupedId (альбом: подпись лежит на одном из сообщений)
 const TEXTS_LIMIT = 5000;
+
+function setLimited(map, key, value) {
+  map.delete(key); // переставляем в конец, чтобы старые вытеснялись первыми
+  map.set(key, value);
+  if (map.size > TEXTS_LIMIT) map.delete(map.keys().next().value);
+}
 
 function rememberChat(chat) {
   if (!chat?.id || !chat.accessHash) return;
@@ -71,12 +78,14 @@ function rememberChat(chat) {
 }
 
 function rememberMessage(chatId, id, message) {
-  const text = message?.content?.text;
-  if (!chatId || !Number.isInteger(id) || !text?.text) return;
-  const key = `${chatId}|${id}`;
-  TEXTS.delete(key); // переставляем в конец, чтобы старые вытеснялись первыми
-  TEXTS.set(key, { text: text.text, entities: text.entities });
-  if (TEXTS.size > TEXTS_LIMIT) TEXTS.delete(TEXTS.keys().next().value);
+  if (!chatId || !Number.isInteger(id) || !message) return;
+  const { groupedId } = message;
+  if (groupedId) setLimited(GROUPS, `${chatId}|${id}`, groupedId);
+  const text = message.content?.text;
+  if (!text?.text) return;
+  const value = { text: text.text, entities: text.entities };
+  setLimited(TEXTS, `${chatId}|${id}`, value);
+  if (groupedId) setLimited(TEXTS, `${chatId}|g${groupedId}`, value);
 }
 
 function rememberFromResponse(res) {
@@ -94,7 +103,8 @@ function rememberFromUpdate(u) {
 
 // Текст поста с форматированием: из кэша, иначе запросом к API, иначе голый текст со страницы
 async function getPostText({ chatId, messageId, domText }) {
-  const cached = TEXTS.get(`${chatId}|${messageId}`);
+  const groupedId = GROUPS.get(`${chatId}|${messageId}`);
+  const cached = TEXTS.get(`${chatId}|${messageId}`) || (groupedId && TEXTS.get(`${chatId}|g${groupedId}`));
   if (cached) return cached;
 
   const chat = CHATS.get(chatId);
@@ -103,7 +113,8 @@ async function getPostText({ chatId, messageId, domText }) {
       const res = await callApi('fetchMessage', [{ chat, messageId }]);
       const text = res?.message?.content?.text;
       if (text?.text) return { text: text.text, entities: text.entities };
-      if (res?.message) return null; // пост есть, текста у него нет
+      // Пост есть, текста у него нет (в альбоме подпись может быть на соседнем сообщении)
+      if (res?.message && !domText) return null;
     } catch (err) {
       console.warn('[TG-FWD] fetchMessage failed:', err);
     }
@@ -113,17 +124,26 @@ async function getPostText({ chatId, messageId, domText }) {
 }
 
 function callApi(name, args, onCallback) {
+  return callApiMany([{ name, args, onCallback }])[0];
+}
+
+// Несколько вызовов одним сообщением воркеру — так TG обрабатывает их подряд (нужно для альбомов)
+function callApiMany(calls) {
   if (!apiWorker) {
-    return Promise.reject(new Error('API TG не найден. Закрой другие вкладки Telegram и перезагрузи эту'));
+    const err = new Error('API TG не найден. Закрой другие вкладки Telegram и перезагрузи эту');
+    return calls.map(() => Promise.reject(err));
   }
-  const messageId = `tgdl_${Date.now()}_${++callSeq}`;
-  return new Promise((resolve, reject) => {
-    pendingCalls.set(messageId, { resolve, reject, onCallback });
+  const payloads = [];
+  const promises = calls.map(({ name, args, onCallback }) => {
+    const messageId = `tgdl_${Date.now()}_${++callSeq}`;
     // Воркер сам допишет callback последним аргументом, если withCallback
-    origPostMessage.call(apiWorker, {
-      payloads: [{ type: 'callMethod', messageId, name, args, withCallback: Boolean(onCallback) }],
+    payloads.push({ type: 'callMethod', messageId, name, args, withCallback: Boolean(onCallback) });
+    return new Promise((resolve, reject) => {
+      pendingCalls.set(messageId, { resolve, reject, onCallback });
     });
   });
+  origPostMessage.call(apiWorker, { payloads });
+  return promises;
 }
 
 // ---------- Выбор чата ----------
@@ -268,10 +288,11 @@ function readVideoMeta(blobUrl) {
     video.addEventListener('seeked', () => {
       clearTimeout(timer);
       const meta = { width: video.videoWidth, height: video.videoHeight, duration: video.duration };
-      const size = Math.min(320, video.videoWidth);
+      const scale = Math.min(1, 320 / Math.max(video.videoWidth, video.videoHeight));
       const canvas = document.createElement('canvas');
-      canvas.width = canvas.height = size;
-      canvas.getContext('2d').drawImage(video, 0, 0, size, size);
+      canvas.width = Math.round(video.videoWidth * scale);
+      canvas.height = Math.round(video.videoHeight * scale);
+      canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
       canvas.toBlob((thumb) => {
         meta.previewBlobUrl = thumb ? URL.createObjectURL(thumb) : undefined;
         resolve(meta);
@@ -282,20 +303,21 @@ function readVideoMeta(blobUrl) {
   });
 }
 
-// Ждём от воркера итог отправки нашего сообщения в чат chatId.
-// Локальное (ещё не отправленное) сообщение TG создаёт с дробным id
-function watchSendResult(chatId) {
-  let localId = null;
+// Ждём от воркера итог отправки count наших сообщений в чат chatId.
+// Локальные (ещё не отправленные) сообщения TG создаёт с дробным id
+function watchSendResult(chatId, count = 1) {
+  const localIds = new Set();
+  let succeeded = 0;
   let settle;
   const done = new Promise((resolve) => { settle = resolve; });
   const listener = (u) => {
     if (u.chatId !== chatId) return;
     console.log('[TG-FWD] update', u['@type'], u.id ?? u.localId, u.error || '');
-    if (u['@type'] === 'newMessage' && localId === null && !Number.isInteger(u.id)) {
-      localId = u.id;
-    } else if (u['@type'] === 'updateMessageSendSucceeded' && u.localId === localId) {
-      settle('ok');
-    } else if (u['@type'] === 'updateMessageSendFailed' && u.localId === localId) {
+    if (u['@type'] === 'newMessage' && localIds.size < count && !Number.isInteger(u.id)) {
+      localIds.add(u.id);
+    } else if (u['@type'] === 'updateMessageSendSucceeded' && localIds.has(u.localId)) {
+      if (++succeeded === count) settle('ok');
+    } else if (u['@type'] === 'updateMessageSendFailed' && localIds.has(u.localId)) {
       settle(u.error || 'ошибка отправки');
     }
   };
@@ -361,7 +383,7 @@ async function buildAttachment(kind, blob, contentType) {
   const base = { size: blob.size, uniqueId: `tgdl_${Date.now()}` };
   let attachment;
 
-  if (kind === 'circle') {
+  if (kind === 'circle' || kind === 'video') {
     const blobUrl = makeUrl(new Blob([blob], { type: 'video/mp4' }));
     const meta = await readVideoMeta(blobUrl);
     if (meta.previewBlobUrl) urls.push(meta.previewBlobUrl);
@@ -372,7 +394,7 @@ async function buildAttachment(kind, blob, contentType) {
       mimeType: 'video/mp4',
       quick: { width: meta.width, height: meta.height, duration: meta.duration },
       previewBlobUrl: meta.previewBlobUrl,
-      isRoundVideo: true,
+      ...(kind === 'circle' && { isRoundVideo: true }),
     };
   } else if (kind === 'photo') {
     // Фото TG принимает как фото только в jpeg/png, остальное — файлом
@@ -404,11 +426,12 @@ async function buildAttachment(kind, blob, contentType) {
   return { attachment, cleanup };
 }
 
-// Отправляет одно сообщение (params для sendMessage без chat) и ждёт подтверждения
-async function sendOne(target, params, onStatus) {
+// Отправляет сообщения (params для sendMessage без chat) одной пачкой и ждёт подтверждения всех.
+// Несколько params с общим groupedId TG соберёт в альбом
+async function sendBatch(target, paramsList, onStatus) {
   onStatus('Отправляю…');
-  console.log('[TG-FWD] sending to', target.id, params);
-  const watch = watchSendResult(target.id);
+  console.log('[TG-FWD] sending to', target.id, paramsList);
+  const watch = watchSendResult(target.id, paramsList.length);
   // Если от TG долго нет ни прогресса, ни ответа — считаем, что зависло
   let stallTimer;
   let armStall;
@@ -419,18 +442,24 @@ async function sendOne(target, params, onStatus) {
     };
   });
   armStall();
+  const progresses = paramsList.map(() => 0);
   let lastLogged = -1;
   let result;
   try {
     await Promise.race([
-      callApi('sendMessage', [{ chat: target, ...params }], (progress) => {
-        armStall();
-        if (typeof progress !== 'number') return;
-        const percent = Math.round(progress * 100);
-        if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', progress);
-        lastLogged = percent;
-        onStatus(`Отправляю ${percent}%`);
-      }),
+      Promise.all(callApiMany(paramsList.map((params, i) => ({
+        name: 'sendMessage',
+        args: [{ chat: target, ...params }],
+        onCallback: (progress) => {
+          armStall();
+          if (typeof progress !== 'number') return;
+          progresses[i] = progress;
+          const percent = Math.round(progresses.reduce((a, b) => a + b, 0) / progresses.length * 100);
+          if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', percent);
+          lastLogged = percent;
+          onStatus(`Отправляю ${percent}%`);
+        },
+      })))),
       stalled,
     ]);
     result = await watch.result(5000);
@@ -445,36 +474,48 @@ async function sendOne(target, params, onStatus) {
 // Подпись к медиа без Premium — до 1024 символов, длиннее шлём отдельным сообщением
 const CAPTION_LIMIT = 1024;
 
-// kind: 'circle' | 'photo' | 'voice' | 'text'. post — { chatId, messageId, domText } исходного поста
-async function forward({ url, kind, post }, onStatus) {
+// kind: 'circle' | 'video' | 'photo' | 'voice' | 'text' | 'album'.
+// Для альбома items — [{ url, kind: 'photo' | 'video' }]. post — { chatId, messageId, domText } исходного поста
+async function forward({ url, kind, items, post }, onStatus) {
   const target = await pickTarget();
   if (!target) { onStatus('Отменено', 'idle'); return; }
 
   // У кружков подписи не бывает
   const text = kind === 'circle' || !post ? null : await getPostText(post);
+  const textParams = text && { text: text.text, entities: text.entities };
 
   if (kind === 'text') {
     if (!text) throw new Error('не нашёл текст поста');
-    await sendOne(target, { text: text.text, entities: text.entities }, onStatus);
+    await sendBatch(target, [textParams], onStatus);
     onStatus(`✓ В «${target.title}»`, 'done');
     return;
   }
 
-  onStatus('Скачиваю…');
-  const { blob, contentType } = await fetchMedia(url, (p) => onStatus(`Скачиваю ${p}%`));
-  const { attachment, cleanup } = await buildAttachment(kind, blob, contentType);
-
-  const asCaption = text && text.text.length <= CAPTION_LIMIT;
+  const media = kind === 'album' ? items : [{ url, kind }];
+  const attachments = [];
+  const cleanups = [];
   try {
-    await sendOne(target, {
+    for (const [i, item] of media.entries()) {
+      const label = media.length > 1 ? `Скачиваю ${i + 1}/${media.length}` : 'Скачиваю';
+      onStatus(`${label}…`);
+      const { blob, contentType } = await fetchMedia(item.url, (p) => onStatus(`${label} ${p}%`));
+      const { attachment, cleanup } = await buildAttachment(item.kind, blob, contentType);
+      attachments.push(attachment);
+      cleanups.push(cleanup);
+    }
+
+    // Подпись — на первом элементе, как делает сам TG
+    const asCaption = text && text.text.length <= CAPTION_LIMIT;
+    const groupedId = attachments.length > 1 ? `tgdl${Date.now()}` : undefined;
+    await sendBatch(target, attachments.map((attachment, i) => ({
       attachment,
-      ...(asCaption && { text: text.text, entities: text.entities }),
-    }, onStatus);
+      ...(groupedId && { groupedId }),
+      ...(asCaption && i === 0 && textParams),
+    })), onStatus);
+
+    if (text && !asCaption) await sendBatch(target, [textParams], onStatus);
   } finally {
-    cleanup();
-  }
-  if (text && !asCaption) {
-    await sendOne(target, { text: text.text, entities: text.entities }, onStatus);
+    cleanups.forEach((cleanup) => cleanup());
   }
   onStatus(`✓ В «${target.title}»`, 'done');
 }
