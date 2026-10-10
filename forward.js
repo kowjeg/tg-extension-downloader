@@ -138,12 +138,23 @@ function callApiMany(calls) {
     const messageId = `tgdl_${Date.now()}_${++callSeq}`;
     // Воркер сам допишет callback последним аргументом, если withCallback
     payloads.push({ type: 'callMethod', messageId, name, args, withCallback: Boolean(onCallback) });
-    return new Promise((resolve, reject) => {
+    const promise = new Promise((resolve, reject) => {
       pendingCalls.set(messageId, { resolve, reject, onCallback });
     });
+    promise.messageId = messageId;
+    return promise;
   });
   origPostMessage.call(apiWorker, { payloads });
   return promises;
+}
+
+// Отменяет зависшие вызовы: воркер помечает их прогресс отменённым, ответов мы больше не ждём
+function cancelCalls(messageIds) {
+  if (!apiWorker || !messageIds.length) return;
+  origPostMessage.call(apiWorker, {
+    payloads: messageIds.map((messageId) => ({ type: 'cancelProgress', messageId })),
+  });
+  messageIds.forEach((id) => pendingCalls.delete(id));
 }
 
 // ---------- Выбор чата ----------
@@ -347,7 +358,7 @@ function readImageMeta(blobUrl) {
 
 // Длительность и волна войса (63 точки 0–255, как отправляет сам TG Web A)
 const WAVEFORM_POINTS = 63;
-const STALL_TIMEOUT = 60 * 1000;
+const STALL_TIMEOUT = 30 * 1000;
 async function readVoiceMeta(blob) {
   const ctx = new OfflineAudioContext(1, 1, 8000);
   try {
@@ -445,8 +456,26 @@ function enableUploadDebug() {
     .catch((err) => console.warn('[TG-FWD] upload debug not available:', err));
 }
 
+// Отправка с одним автоповтором, если TG завис (у больших файлов терялся ответ на последнюю часть)
 async function sendBatch(target, paramsList, onStatus) {
   enableUploadDebug();
+  stopBackgroundAudio();
+  try {
+    await sendBatchOnce(target, paramsList, onStatus);
+  } catch (err) {
+    if (!err.isStall) throw err;
+    console.warn('[TG-FWD] upload stalled, retrying once');
+    onStatus('Завис, пробую ещё раз…');
+    stopBackgroundAudio();
+    await new Promise((r) => setTimeout(r, 2000));
+    const retryParams = paramsList.map((params) => (params.attachment
+      ? { ...params, attachment: { ...params.attachment, uniqueId: `${params.attachment.uniqueId}_retry` } }
+      : params));
+    await sendBatchOnce(target, retryParams, onStatus);
+  }
+}
+
+async function sendBatchOnce(target, paramsList, onStatus) {
   onStatus('Отправляю…');
   console.log('[TG-FWD] sending to', target.id, paramsList);
   const watch = watchSendResult(target.id, paramsList.length);
@@ -456,31 +485,33 @@ async function sendBatch(target, paramsList, onStatus) {
   const stalled = new Promise((_, reject) => {
     armStall = () => {
       clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => reject(new Error('TG не отвечает (таймаут)')), STALL_TIMEOUT);
+      stallTimer = setTimeout(() => reject(Object.assign(new Error('TG не отвечает (таймаут)'), { isStall: true })), STALL_TIMEOUT);
     };
   });
   armStall();
   const progresses = paramsList.map(() => 0);
   let lastLogged = -1;
   let result;
+  let calls = [];
   try {
-    await Promise.race([
-      Promise.all(callApiMany(paramsList.map((params, i) => ({
-        name: 'sendMessage',
-        args: [{ chat: target, ...params }],
-        onCallback: (progress) => {
-          armStall();
-          if (typeof progress !== 'number') return;
-          progresses[i] = progress;
-          const percent = Math.round(progresses.reduce((a, b) => a + b, 0) / progresses.length * 100);
-          if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', percent);
-          lastLogged = percent;
-          onStatus(`Отправляю ${percent}%`);
-        },
-      })))),
-      stalled,
-    ]);
+    calls = callApiMany(paramsList.map((params, i) => ({
+      name: 'sendMessage',
+      args: [{ chat: target, ...params }],
+      onCallback: (progress) => {
+        armStall();
+        if (typeof progress !== 'number') return;
+        progresses[i] = progress;
+        const percent = Math.round(progresses.reduce((a, b) => a + b, 0) / progresses.length * 100);
+        if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', percent);
+        lastLogged = percent;
+        onStatus(`Отправляю ${percent}%`);
+      },
+    })));
+    await Promise.race([Promise.all(calls), stalled]);
     result = await watch.result(5000);
+  } catch (err) {
+    if (err.isStall) cancelCalls(calls.map((c) => c.messageId));
+    throw err;
   } finally {
     clearTimeout(stallTimer);
     watch.stop();

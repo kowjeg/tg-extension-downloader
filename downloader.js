@@ -6,12 +6,40 @@
 // on another element, and reuses an already prefetched element without setting src again
 const _play = HTMLMediaElement.prototype.play;
 HTMLMediaElement.prototype.play = function (...args) {
+  if (this.tagName === 'AUDIO') AUDIO_ELEMENTS.add(this);
   const src = this.getAttribute('src') || this.currentSrc;
   if (this.tagName === 'AUDIO' && src && (src.startsWith('https://') || src.startsWith('blob:'))) {
     window.postMessage({ type: 'TG_DL_AUDIO_SRC', url: new URL(src, location.href).href }, window.location.origin);
   }
   return _play.apply(this, args);
 };
+
+// Все Audio, которые TG проигрывал или подгружал заранее (prefetch выставляет src без play)
+const AUDIO_ELEMENTS = new Set();
+const _srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+  ..._srcDesc,
+  set(v) {
+    if (this.tagName === 'AUDIO') AUDIO_ELEMENTS.add(this);
+    return _srcDesc.set.call(this, v);
+  },
+});
+
+// Останавливает подгрузку аудио плеером TG: параллельное скачивание того же файла
+// мешает загрузке (у больших файлов терялся ответ на последнюю часть).
+// TG сам выставит src заново при следующем нажатии ▶ на войсе
+function stopBackgroundAudio() {
+  let stopped = 0;
+  AUDIO_ELEMENTS.forEach((el) => {
+    if (!el.getAttribute('src')) return;
+    el.pause();
+    el.removeAttribute('src');
+    el.load();
+    stopped++;
+  });
+  AUDIO_ELEMENTS.clear();
+  if (stopped) console.log('[TG-DL] stopped background audio:', stopped);
+}
 
 const EXT_BY_TYPE = [
   ['webm', 'webm'], ['jpeg', 'jpg'], ['jpg', 'jpg'], ['png', 'png'],
