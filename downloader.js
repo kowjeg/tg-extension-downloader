@@ -1,19 +1,17 @@
 // Runs in page context (MAIN world, document_start) — has access to the TG service worker
 
 // Voice messages are played through a detached Audio element (not in DOM),
-// so catch its src when TG sets it and pass it to content.js
-const _srcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-  configurable: true,
-  enumerable: _srcDesc.enumerable,
-  get: _srcDesc.get,
-  set(v) {
-    if (this.tagName === 'AUDIO' && typeof v === 'string' && (v.startsWith('https://') || v.startsWith('blob:'))) {
-      window.postMessage({ type: 'TG_DL_AUDIO_SRC', url: v }, window.location.origin);
-    }
-    return _srcDesc.set.call(this, v);
-  },
-});
+// so catch its src when TG starts playing it and pass it to content.js.
+// Hook play(), not the src setter: TG prefetches the next voice by setting src
+// on another element, and reuses an already prefetched element without setting src again
+const _play = HTMLMediaElement.prototype.play;
+HTMLMediaElement.prototype.play = function (...args) {
+  const src = this.getAttribute('src') || this.currentSrc;
+  if (this.tagName === 'AUDIO' && src && (src.startsWith('https://') || src.startsWith('blob:'))) {
+    window.postMessage({ type: 'TG_DL_AUDIO_SRC', url: new URL(src, location.href).href }, window.location.origin);
+  }
+  return _play.apply(this, args);
+};
 
 const EXT_BY_TYPE = [
   ['webm', 'webm'], ['jpeg', 'jpg'], ['jpg', 'jpg'], ['png', 'png'],

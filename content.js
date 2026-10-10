@@ -5,7 +5,7 @@
 const PROCESSED = new WeakSet();
 
 // Войсы: TG играет их через Audio вне DOM, поэтому ссылку ловим в downloader.js
-// при нажатии ▶ и привязываем к войсу, по которому только что кликнули
+// при запуске воспроизведения и привязываем к войсу, по которому только что кликнули
 const VOICE_URLS = new Map(); // "#чат|id сообщения" -> url
 let pendingVoice = null;      // { key, at }
 
@@ -16,6 +16,7 @@ function voiceKey(voiceEl) {
 }
 
 document.addEventListener('click', (e) => {
+  if (e.target.closest?.('.tg-dl-wrap')) return; // клик по нашим кнопкам — не ▶
   const voiceEl = e.target.closest?.('.message-content.voice');
   const key = voiceEl && voiceKey(voiceEl);
   if (key) pendingVoice = { key, at: Date.now() };
@@ -26,8 +27,8 @@ window.addEventListener('message', (e) => {
   if (e.data?.type === 'TG_DL_READY') {
     chrome.runtime.sendMessage({ type: 'TG_DL', url: e.data.url, filename: e.data.filename });
   } else if (e.data?.type === 'TG_DL_AUDIO_SRC') {
-    // Берём только ссылку, пришедшую сразу после клика (не автопереход к следующему войсу)
-    if (!pendingVoice || Date.now() - pendingVoice.at > 5000) return;
+    // Берём только первый запуск сразу после клика (не автопереход к следующему войсу)
+    if (!pendingVoice || Date.now() - pendingVoice.at > 2000) return;
     VOICE_URLS.set(pendingVoice.key, e.data.url);
     pendingVoice = null;
     processMedia();
@@ -154,14 +155,18 @@ function processMedia() {
   // Войсы — кнопка появляется после первого ▶ (когда известна ссылка)
   const voices = chatRoot.querySelectorAll('.message-content.voice');
   voices.forEach((voiceEl) => {
-    if (voiceEl.querySelector('.tg-dl-wrap')) return;
     const key = voiceKey(voiceEl);
     const url = key && VOICE_URLS.get(key);
     if (!url) return;
+    // Кнопки уже есть с этой ссылкой — ничего не делаем; с другой — пересоздаём
+    const existing = voiceEl.querySelector('.tg-dl-wrap');
+    if (existing?.dataset.url === url) return;
+    existing?.remove();
 
     const anchor = voiceEl.querySelector('.Audio') || voiceEl.firstElementChild;
     if (!anchor) return;
     const btn = makeButton(url, `${getMediaName(voiceEl, 'voice')}.ogg`);
+    btn.dataset.url = url;
     addForwardButton(btn, url, 'voice');
     anchor.insertAdjacentElement('afterend', btn);
   });
