@@ -201,12 +201,10 @@ function pickTarget() {
     overlay.innerHTML = `
       <div class="tg-fwd-modal">
         <div class="tg-fwd-head">Куда переслать</div>
+        <label class="tg-fwd-check"><input type="checkbox" checked> Указать, откуда переслано</label>
         <input class="tg-fwd-search" placeholder="Поиск или @username + Enter">
         <div class="tg-fwd-list"></div>
-        <div class="tg-fwd-foot">
-          <label class="tg-fwd-check"><input type="checkbox" checked> Указать, откуда переслано</label>
-          <button class="tg-fwd-cancel">Отмена</button>
-        </div>
+        <button class="tg-fwd-cancel">Отмена</button>
       </div>`;
     document.body.appendChild(overlay);
 
@@ -359,6 +357,9 @@ function readImageMeta(blobUrl) {
 // Длительность и волна войса (63 точки 0–255, как отправляет сам TG Web A)
 const WAVEFORM_POINTS = 63;
 const STALL_TIMEOUT = 30 * 1000;
+// У больших файлов зависает последняя часть — если почти всё загружено, ждём меньше
+const STALL_TIMEOUT_NEAR_END = 10 * 1000;
+const NEAR_END_PROGRESS = 0.9;
 async function readVoiceMeta(blob) {
   const ctx = new OfflineAudioContext(1, 1, 8000);
   try {
@@ -485,11 +486,15 @@ async function sendBatchOnce(target, paramsList, onStatus) {
   const stalled = new Promise((_, reject) => {
     armStall = () => {
       clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => reject(Object.assign(new Error('TG не отвечает (таймаут)'), { isStall: true })), STALL_TIMEOUT);
+      const nearEnd = progresses.every((p) => p >= NEAR_END_PROGRESS) && progresses.some((p) => p < 1);
+      stallTimer = setTimeout(
+        () => reject(Object.assign(new Error('TG не отвечает (таймаут)'), { isStall: true })),
+        nearEnd ? STALL_TIMEOUT_NEAR_END : STALL_TIMEOUT,
+      );
     };
   });
-  armStall();
   const progresses = paramsList.map(() => 0);
+  armStall();
   let lastLogged = -1;
   let result;
   let calls = [];
@@ -498,9 +503,9 @@ async function sendBatchOnce(target, paramsList, onStatus) {
       name: 'sendMessage',
       args: [{ chat: target, ...params }],
       onCallback: (progress) => {
+        if (typeof progress === 'number') progresses[i] = progress;
         armStall();
         if (typeof progress !== 'number') return;
-        progresses[i] = progress;
         const percent = Math.round(progresses.reduce((a, b) => a + b, 0) / progresses.length * 100);
         if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', percent);
         lastLogged = percent;
