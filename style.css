@@ -82,3 +82,18 @@
   font-size: 14px;
 }
 .tg-fwd-section { color: #8ab4f8; font-size: 12px; padding: 8px 6px 4px; }
+
+/* Кнопка пересылки у текстовых постов — в углу, только при наведении */
+.message-content:has(> .tg-fwd-text-wrap) { position: relative; }
+.tg-fwd-text-wrap {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  margin: 0;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.tg-fwd-text-wrap .tg-dl-btn { margin-top: 0; }
+.message-content:hover > .tg-fwd-text-wrap,
+.tg-fwd-text-wrap:has(.tg-fwd-btn[data-state]:not([data-state=""])) { opacity: 1; }

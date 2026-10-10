@@ -1,4 +1,4 @@
-// Пересылка кружков, фото и войсов от своего имени через внутренний API TG Web A.
+// Пересылка постов (кружки, фото, войсы, текст) от своего имени через внутренний API TG Web A.
 // Runs in page context (MAIN world, document_start).
 //
 // TG Web A ходит в Telegram через GramJS в отдельном Web Worker. Протокол:
@@ -36,9 +36,13 @@ function attachWorker(worker) {
     if (!Array.isArray(data?.payloads)) return;
     data.payloads.forEach((p) => {
       if (p.type === 'updates') {
-        p.updates.forEach((u) => updateListeners.forEach((fn) => fn(u)));
+        p.updates.forEach((u) => {
+          rememberFromUpdate(u);
+          updateListeners.forEach((fn) => fn(u));
+        });
         return;
       }
+      if (p.type === 'methodResponse') rememberFromResponse(p.response);
       const call = pendingCalls.get(p.messageId);
       if (!call) return; // не наш вызов — его обработает сам TG
       if (p.type === 'methodCallback') {
@@ -51,6 +55,61 @@ function attachWorker(worker) {
       }
     });
   });
+}
+
+// ---------- Кэш чатов и текстов постов ----------
+// Всё, что TG Web A загружает для показа (чаты с accessHash, сообщения с форматированием),
+// проходит через воркер — запоминаем по дороге, чтобы не запрашивать заново
+
+const CHATS = new Map();  // chatId -> ApiChat
+const TEXTS = new Map();  // "chatId|messageId" -> { text, entities }
+const TEXTS_LIMIT = 5000;
+
+function rememberChat(chat) {
+  if (!chat?.id || !chat.accessHash) return;
+  CHATS.set(chat.id, { ...CHATS.get(chat.id), ...chat });
+}
+
+function rememberMessage(chatId, id, message) {
+  const text = message?.content?.text;
+  if (!chatId || !Number.isInteger(id) || !text?.text) return;
+  const key = `${chatId}|${id}`;
+  TEXTS.delete(key); // переставляем в конец, чтобы старые вытеснялись первыми
+  TEXTS.set(key, { text: text.text, entities: text.entities });
+  if (TEXTS.size > TEXTS_LIMIT) TEXTS.delete(TEXTS.keys().next().value);
+}
+
+function rememberFromResponse(res) {
+  if (!res || typeof res !== 'object') return;
+  if (Array.isArray(res.chats)) res.chats.forEach(rememberChat);
+  if (res.chat) rememberChat(res.chat);
+  if (Array.isArray(res.messages)) res.messages.forEach((m) => rememberMessage(m?.chatId, m?.id, m));
+  if (res.message) rememberMessage(res.message.chatId, res.message.id, res.message);
+}
+
+function rememberFromUpdate(u) {
+  if (u.chat) rememberChat(u.chat);
+  if (u.message) rememberMessage(u.chatId || u.message.chatId, u.id ?? u.message.id, u.message);
+}
+
+// Текст поста с форматированием: из кэша, иначе запросом к API, иначе голый текст со страницы
+async function getPostText({ chatId, messageId, domText }) {
+  const cached = TEXTS.get(`${chatId}|${messageId}`);
+  if (cached) return cached;
+
+  const chat = CHATS.get(chatId);
+  if (chat) {
+    try {
+      const res = await callApi('fetchMessage', [{ chat, messageId }]);
+      const text = res?.message?.content?.text;
+      if (text?.text) return { text: text.text, entities: text.entities };
+      if (res?.message) return null; // пост есть, текста у него нет
+    } catch (err) {
+      console.warn('[TG-FWD] fetchMessage failed:', err);
+    }
+  }
+  console.log('[TG-FWD] text from page (formatting lost)', chatId, messageId);
+  return domText ? { text: domText } : null;
 }
 
 function callApi(name, args, onCallback) {
@@ -345,62 +404,88 @@ async function buildAttachment(kind, blob, contentType) {
   return { attachment, cleanup };
 }
 
-async function forwardMedia(url, kind, onStatus) {
+// Отправляет одно сообщение (params для sendMessage без chat) и ждёт подтверждения
+async function sendOne(target, params, onStatus) {
+  onStatus('Отправляю…');
+  console.log('[TG-FWD] sending to', target.id, params);
+  const watch = watchSendResult(target.id);
+  // Если от TG долго нет ни прогресса, ни ответа — считаем, что зависло
+  let stallTimer;
+  let armStall;
+  const stalled = new Promise((_, reject) => {
+    armStall = () => {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => reject(new Error('TG не отвечает (таймаут)')), STALL_TIMEOUT);
+    };
+  });
+  armStall();
+  let lastLogged = -1;
+  let result;
+  try {
+    await Promise.race([
+      callApi('sendMessage', [{ chat: target, ...params }], (progress) => {
+        armStall();
+        if (typeof progress !== 'number') return;
+        const percent = Math.round(progress * 100);
+        if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', progress);
+        lastLogged = percent;
+        onStatus(`Отправляю ${percent}%`);
+      }),
+      stalled,
+    ]);
+    result = await watch.result(5000);
+  } finally {
+    clearTimeout(stallTimer);
+    watch.stop();
+  }
+
+  if (result !== 'ok') throw new Error(result || 'загрузка не удалась');
+}
+
+// Подпись к медиа без Premium — до 1024 символов, длиннее шлём отдельным сообщением
+const CAPTION_LIMIT = 1024;
+
+// kind: 'circle' | 'photo' | 'voice' | 'text'. post — { chatId, messageId, domText } исходного поста
+async function forward({ url, kind, post }, onStatus) {
   const target = await pickTarget();
   if (!target) { onStatus('Отменено', 'idle'); return; }
+
+  // У кружков подписи не бывает
+  const text = kind === 'circle' || !post ? null : await getPostText(post);
+
+  if (kind === 'text') {
+    if (!text) throw new Error('не нашёл текст поста');
+    await sendOne(target, { text: text.text, entities: text.entities }, onStatus);
+    onStatus(`✓ В «${target.title}»`, 'done');
+    return;
+  }
 
   onStatus('Скачиваю…');
   const { blob, contentType } = await fetchMedia(url, (p) => onStatus(`Скачиваю ${p}%`));
   const { attachment, cleanup } = await buildAttachment(kind, blob, contentType);
 
+  const asCaption = text && text.text.length <= CAPTION_LIMIT;
   try {
-    onStatus('Отправляю…');
-    console.log('[TG-FWD] sending', kind, 'to', target.id, attachment);
-    const watch = watchSendResult(target.id);
-    // Если от TG долго нет ни прогресса, ни ответа — считаем, что зависло
-    let stallTimer;
-    let armStall;
-    const stalled = new Promise((_, reject) => {
-      armStall = () => {
-        clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => reject(new Error('TG не отвечает (таймаут)')), STALL_TIMEOUT);
-      };
-    });
-    armStall();
-    let lastLogged = -1;
-    let result;
-    try {
-      await Promise.race([
-        callApi('sendMessage', [{ chat: target, attachment }], (progress) => {
-          armStall();
-          if (typeof progress !== 'number') return;
-          const percent = Math.round(progress * 100);
-          if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', progress);
-          lastLogged = percent;
-          onStatus(`Отправляю ${percent}%`);
-        }),
-        stalled,
-      ]);
-      result = await watch.result(5000);
-    } finally {
-      clearTimeout(stallTimer);
-      watch.stop();
-    }
-
-    if (result === 'ok') onStatus(`✓ В «${target.title}»`, 'done');
-    else throw new Error(result || 'загрузка не удалась');
+    await sendOne(target, {
+      attachment,
+      ...(asCaption && { text: text.text, entities: text.entities }),
+    }, onStatus);
   } finally {
     cleanup();
   }
+  if (text && !asCaption) {
+    await sendOne(target, { text: text.text, entities: text.entities }, onStatus);
+  }
+  onStatus(`✓ В «${target.title}»`, 'done');
 }
 
 window.addEventListener('tg-fwd-request', async (e) => {
-  const { url, kind, reqId } = e.detail;
+  const { reqId } = e.detail;
   const onStatus = (text, state = 'busy') => {
     window.postMessage({ type: 'TG_FWD_STATUS', reqId, text, state }, window.location.origin);
   };
   try {
-    await forwardMedia(url, kind, onStatus);
+    await forward(e.detail, onStatus);
   } catch (err) {
     console.error('[TG-FWD] error:', err);
     onStatus('Ошибка: ' + err.message, 'error');

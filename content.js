@@ -51,12 +51,28 @@ window.addEventListener('message', (e) => {
   }
 });
 
-// Пересылка кружков, фото и войсов от своего имени (forward.js)
+// Пересылка постов от своего имени (forward.js): медиа вместе с текстом поста, либо только текст
 const FWD_LABEL = '↪ Переслать';
 const FWD_BUTTONS = new Map(); // reqId -> кнопка, ждущая статуса
 let fwdSeq = 0;
 
-function addForwardButton(wrap, url, kind) {
+// Откуда пересылаем: чат, id сообщения и текст со страницы (запасной вариант без форматирования)
+function getPostInfo(el) {
+  const msg = el.closest('[data-message-id]');
+  const messageId = Number(msg?.getAttribute('data-message-id'));
+  const chatId = location.hash.slice(1).split(/[_?]/)[0];
+  const textEl = msg?.querySelector('.text-content');
+  let domText = '';
+  if (textEl) {
+    const clone = textEl.cloneNode(true);
+    clone.querySelectorAll('.MessageMeta, .tg-dl-wrap').forEach((n) => n.remove());
+    domText = clone.innerText.trim();
+  }
+  return Number.isInteger(messageId) && chatId ? { chatId, messageId, domText } : null;
+}
+
+// sourceEl — элемент внутри исходного сообщения, по нему находим пост в момент нажатия
+function addForwardButton(wrap, url, kind, sourceEl) {
   const btn = document.createElement('button');
   btn.className = 'tg-dl-btn tg-fwd-btn';
   btn.textContent = FWD_LABEL;
@@ -67,7 +83,7 @@ function addForwardButton(wrap, url, kind) {
     const reqId = ++fwdSeq;
     FWD_BUTTONS.set(reqId, btn);
     btn.dataset.state = 'busy';
-    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, kind, reqId } }));
+    window.dispatchEvent(new CustomEvent('tg-fwd-request', { detail: { url, kind, reqId, post: getPostInfo(sourceEl) } }));
   });
 
   wrap.append(btn);
@@ -138,7 +154,7 @@ function processMedia() {
     // чтобы overflow:hidden не обрезал кнопку
     const mediaContainer = img.closest('.media-photo, .album-item') || img.parentElement;
     const btn = makeButton(src, `${getMediaName(img, 'photo')}.jpg`);
-    addForwardButton(btn, src, 'photo');
+    addForwardButton(btn, src, 'photo', img);
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
@@ -155,7 +171,7 @@ function processMedia() {
     const isCircle = !!vid.closest('.RoundVideo, .media-round');
     const prefix = isCircle ? 'circle' : 'video';
     const btn = makeButton(src, `${getMediaName(vid, prefix)}.mp4`);
-    if (isCircle) addForwardButton(btn, src, 'circle');
+    if (isCircle) addForwardButton(btn, src, 'circle', vid);
     mediaContainer.insertAdjacentElement('afterend', btn);
   });
 
@@ -175,10 +191,28 @@ function processMedia() {
     if (!anchor) return;
     const btn = makeButton(url, `${getMediaName(voiceEl, 'voice')}.ogg`);
     btn.dataset.url = url;
-    addForwardButton(btn, url, 'voice');
+    addForwardButton(btn, url, 'voice', voiceEl);
     anchor.insertAdjacentElement('afterend', btn);
   });
+
+  // Посты только с текстом — кнопка пересылки (видна при наведении)
+  const texts = chatRoot.querySelectorAll('.message-content .text-content');
+  texts.forEach((textEl) => {
+    if (PROCESSED.has(textEl)) return;
+    PROCESSED.add(textEl);
+    const content = textEl.closest('.message-content');
+    if (content.classList.contains('voice') || content.querySelector(TEXT_SKIP_MEDIA)) return;
+    if (content.querySelector(':scope > .tg-fwd-text-wrap')) return;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'tg-dl-wrap tg-fwd-text-wrap';
+    addForwardButton(wrap, null, 'text', textEl);
+    content.appendChild(wrap);
+  });
 }
+
+// Сообщения с медиа (в т.ч. неподдерживаемыми) не считаем текстовыми
+const TEXT_SKIP_MEDIA = '.media-inner, .Album, .File, .Audio, .Poll, .RoundVideo, video, img.full-media';
 
 processMedia();
 
