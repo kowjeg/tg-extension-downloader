@@ -434,7 +434,19 @@ async function buildAttachment(kind, blob, contentType) {
 
 // Отправляет сообщения (params для sendMessage без chat) одной пачкой и ждёт подтверждения всех.
 // Несколько params с общим groupedId TG соберёт в альбом
+// Отладка зависаний загрузки (тестовая ветка): TG сам пишет в консоль по каждой части файла
+// строки «⬆️ [id] …», в т.ч. «getSender took too long» / «sender.send took too long»
+let uploadDebugEnabled = false;
+function enableUploadDebug() {
+  if (uploadDebugEnabled) return;
+  uploadDebugEnabled = true;
+  callApi('setShouldDebugExportedSenders', [true])
+    .then(() => console.log('[TG-FWD] upload debug enabled'))
+    .catch((err) => console.warn('[TG-FWD] upload debug not available:', err));
+}
+
 async function sendBatch(target, paramsList, onStatus) {
+  enableUploadDebug();
   onStatus('Отправляю…');
   console.log('[TG-FWD] sending to', target.id, paramsList);
   const watch = watchSendResult(target.id, paramsList.length);
