@@ -15,10 +15,14 @@ function voiceKey(voiceEl) {
   return id ? `${location.hash}|${id}` : null;
 }
 
+// Отладка войсов (тестовая ветка): все шаги пишутся в консоль с меткой [TG-VOICE]
+const vlog = (...args) => console.log('[TG-VOICE]', ...args);
+
 document.addEventListener('click', (e) => {
   if (e.target.closest?.('.tg-dl-wrap')) return; // клик по нашим кнопкам — не ▶
   const voiceEl = e.target.closest?.('.message-content.voice');
   const key = voiceEl && voiceKey(voiceEl);
+  vlog('click', { key, inVoice: Boolean(voiceEl), target: e.target.className || e.target.tagName });
   if (key) pendingVoice = { key, at: Date.now() };
 }, true);
 
@@ -28,7 +32,9 @@ window.addEventListener('message', (e) => {
     chrome.runtime.sendMessage({ type: 'TG_DL', url: e.data.url, filename: e.data.filename });
   } else if (e.data?.type === 'TG_DL_AUDIO_SRC') {
     // Берём только первый запуск сразу после клика (не автопереход к следующему войсу)
-    if (!pendingVoice || Date.now() - pendingVoice.at > 2000) return;
+    const age = pendingVoice && Date.now() - pendingVoice.at;
+    vlog('play', e.data.url, pendingVoice ? `→ ${pendingVoice.key}, ${age} мс после клика` : '→ клика не было');
+    if (!pendingVoice || age > 2000) return;
     VOICE_URLS.set(pendingVoice.key, e.data.url);
     pendingVoice = null;
     processMedia();
@@ -164,6 +170,7 @@ function processMedia() {
     existing?.remove();
 
     const anchor = voiceEl.querySelector('.Audio') || voiceEl.firstElementChild;
+    vlog('buttons', key, anchor ? 'добавляю' : 'НЕТ места для кнопок', existing ? '(пересоздаю)' : '');
     if (!anchor) return;
     const btn = makeButton(url, `${getMediaName(voiceEl, 'voice')}.ogg`);
     btn.dataset.url = url;
