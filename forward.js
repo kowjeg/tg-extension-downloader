@@ -44,6 +44,7 @@ function attachWorker(worker) {
       if (p.type === 'methodCallback') {
         call.onCallback?.(...p.callbackArgs);
       } else if (p.type === 'methodResponse') {
+        console.log('[TG-FWD] response', p.messageId, p.error || p.response);
         pendingCalls.delete(p.messageId);
         if (p.error) call.reject(new Error(p.error.message || 'API error'));
         else call.resolve(p.response);
@@ -230,6 +231,7 @@ function watchSendResult(chatId) {
   const done = new Promise((resolve) => { settle = resolve; });
   const listener = (u) => {
     if (u.chatId !== chatId) return;
+    console.log('[TG-FWD] update', u['@type'], u.id ?? u.localId, u.error || '');
     if (u['@type'] === 'newMessage' && localId === null && !Number.isInteger(u.id)) {
       localId = u.id;
     } else if (u['@type'] === 'updateMessageSendSucceeded' && u.localId === localId) {
@@ -258,6 +260,7 @@ function readImageMeta(blobUrl) {
 
 // Длительность и волна войса (63 точки 0–255, как отправляет сам TG Web A)
 const WAVEFORM_POINTS = 63;
+const STALL_TIMEOUT = 60 * 1000;
 async function readVoiceMeta(blob) {
   const ctx = new OfflineAudioContext(1, 1, 8000);
   try {
@@ -352,14 +355,35 @@ async function forwardMedia(url, kind, onStatus) {
 
   try {
     onStatus('Отправляю…');
+    console.log('[TG-FWD] sending', kind, 'to', target.id, attachment);
     const watch = watchSendResult(target.id);
+    // Если от TG долго нет ни прогресса, ни ответа — считаем, что зависло
+    let stallTimer;
+    let armStall;
+    const stalled = new Promise((_, reject) => {
+      armStall = () => {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => reject(new Error('TG не отвечает (таймаут)')), STALL_TIMEOUT);
+      };
+    });
+    armStall();
+    let lastLogged = -1;
     let result;
     try {
-      await callApi('sendMessage', [{ chat: target, attachment }], (progress) => {
-        if (typeof progress === 'number') onStatus(`Отправляю ${Math.round(progress * 100)}%`);
-      });
+      await Promise.race([
+        callApi('sendMessage', [{ chat: target, attachment }], (progress) => {
+          armStall();
+          if (typeof progress !== 'number') return;
+          const percent = Math.round(progress * 100);
+          if (percent !== lastLogged && percent % 10 === 9) console.log('[TG-FWD] progress', progress);
+          lastLogged = percent;
+          onStatus(`Отправляю ${percent}%`);
+        }),
+        stalled,
+      ]);
       result = await watch.result(5000);
     } finally {
+      clearTimeout(stallTimer);
       watch.stop();
     }
 
