@@ -5,7 +5,7 @@
 const PROCESSED = new WeakSet();
 
 // Войсы: TG играет их через Audio вне DOM, поэтому ссылку ловим в downloader.js
-// при запуске воспроизведения и привязываем к войсу, по которому только что кликнули
+// при запуске воспроизведения и привязываем к войсу, на который только что нажали
 const VOICE_URLS = new Map(); // "#чат|id сообщения" -> url
 let pendingVoice = null;      // { key, at }
 
@@ -18,11 +18,12 @@ function voiceKey(voiceEl) {
 // Отладка войсов (тестовая ветка): все шаги пишутся в консоль с меткой [TG-VOICE]
 const vlog = (...args) => console.log('[TG-VOICE]', ...args);
 
-document.addEventListener('click', (e) => {
-  if (e.target.closest?.('.tg-dl-wrap')) return; // клик по нашим кнопкам — не ▶
+// pointerdown, а не click: TG иногда запускает войс уже на нажатии, раньше click
+document.addEventListener('pointerdown', (e) => {
+  if (e.target.closest?.('.tg-dl-wrap')) return; // нажатие на наши кнопки — не ▶
   const voiceEl = e.target.closest?.('.message-content.voice');
   const key = voiceEl && voiceKey(voiceEl);
-  vlog('click', { key, inVoice: Boolean(voiceEl), target: e.target.className || e.target.tagName });
+  vlog('press', { key, inVoice: Boolean(voiceEl), target: e.target.className || e.target.tagName });
   if (key) pendingVoice = { key, at: Date.now() };
 }, true);
 
@@ -31,9 +32,9 @@ window.addEventListener('message', (e) => {
   if (e.data?.type === 'TG_DL_READY') {
     chrome.runtime.sendMessage({ type: 'TG_DL', url: e.data.url, filename: e.data.filename });
   } else if (e.data?.type === 'TG_DL_AUDIO_SRC') {
-    // Берём только первый запуск сразу после клика (не автопереход к следующему войсу)
+    // Берём только первый запуск сразу после нажатия (не автопереход к следующему войсу)
     const age = pendingVoice && Date.now() - pendingVoice.at;
-    vlog('play', e.data.url, pendingVoice ? `→ ${pendingVoice.key}, ${age} мс после клика` : '→ клика не было');
+    vlog('play', e.data.url, pendingVoice ? `→ ${pendingVoice.key}, ${age} мс после нажатия` : '→ нажатия не было');
     if (!pendingVoice || age > 2000) return;
     VOICE_URLS.set(pendingVoice.key, e.data.url);
     pendingVoice = null;
